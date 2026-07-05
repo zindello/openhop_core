@@ -2838,3 +2838,93 @@ class TestCoverageSecondPass:
         radio._rx_irq_task = task
         radio.cleanup()
         task.cancel.assert_called_once()
+
+
+# ===========================================================================
+# Regression: gpiod stuck-HIGH double-fire idempotency
+#
+# These tests are designed to FAIL on dev and PASS on fix/gpiod-polling-edge-recovery.
+#
+# When the gpiod polling thread's stuck-HIGH recovery resets last_state and the
+# next tick fires a fresh callback, _handle_interrupt may be called twice before
+# the background task resumes (event loop was blocked by synchronous SPI in the
+# CRC diagnostic path). The second call sees irqStat=0 (already cleared).
+#
+# Dev behaviour: _last_irq_status is unconditionally overwritten to 0.
+# Fix behaviour: _last_irq_status is only updated when irqStat != 0, making
+#                _handle_interrupt truly idempotent.
+# ===========================================================================
+
+
+class TestHandleInterruptIdempotency:
+    """_handle_interrupt must not corrupt _last_irq_status on a second call."""
+
+    def test_second_call_with_zero_irq_preserves_last_irq_status(self, radio):
+        """
+        First call: real IRQ (CRC_ERR). Second call: irqStat=0 (already cleared).
+
+        Dev: _last_irq_status overwritten to 0.
+        Fix: _last_irq_status preserved as IRQ_CRC_ERR.
+        """
+        radio.lora.getIrqStatus.return_value = IRQ_CRC_ERR
+        radio._handle_interrupt()
+        assert radio._last_irq_status == IRQ_CRC_ERR
+
+        radio.lora.getIrqStatus.return_value = IRQ_NONE
+        radio._handle_interrupt()
+
+        assert radio._last_irq_status == IRQ_CRC_ERR, (
+            f"_last_irq_status was overwritten to {radio._last_irq_status:#06x}. "
+            "A second _handle_interrupt call with irqStat=0 must be a no-op. "
+            "On dev this will be 0x0000 — the packet state is corrupted."
+        )
+
+    def test_second_call_with_zero_irq_does_not_set_rx_event_again(self, radio):
+        """
+        The second no-op call must not spuriously set _rx_done_event.
+        (The event is already set from the first call; clearing it then checking
+        that the second call does not re-set it would be an additional side-effect.)
+        """
+        radio.lora.getIrqStatus.return_value = IRQ_RX_DONE
+        radio._handle_interrupt()
+        radio._rx_done_event.clear()  # simulate background task consuming the event
+
+        radio.lora.getIrqStatus.return_value = IRQ_NONE
+        radio._handle_interrupt()
+
+        assert not radio._rx_done_event.is_set(), (
+            "Second _handle_interrupt with irqStat=0 must not re-set _rx_done_event."
+        )
+
+    def test_exact_lockup_sequence_crc_then_rx_then_zero(self, radio):
+        """
+        Reproduce the exact double-fire sequence from the gpiod lockup:
+
+        1. CRC error  → _handle_interrupt (clears CRC IRQ, stores CRC_ERR)
+        2. New packet → _handle_interrupt (clears RX_DONE IRQ, stores RX_DONE)
+        3. Polling recovery fires again → _handle_interrupt (irqStat=0)
+
+        Background task reads _last_irq_status after all three calls complete.
+
+        Dev: _last_irq_status=0 → packet lost (background task sees no IRQ).
+        Fix: _last_irq_status=IRQ_RX_DONE → packet correctly dispatched.
+        """
+        # Call 1: CRC error
+        radio.lora.getIrqStatus.return_value = IRQ_CRC_ERR
+        radio._handle_interrupt()
+
+        # Call 2: new packet (IRQ register updated to RX_DONE)
+        radio.lora.getIrqStatus.return_value = IRQ_RX_DONE
+        radio._handle_interrupt()
+        assert radio._last_irq_status == IRQ_RX_DONE
+
+        # Call 3: polling recovery duplicate — IRQ already cleared
+        radio.lora.getIrqStatus.return_value = IRQ_NONE
+        radio._handle_interrupt()
+
+        assert radio._last_irq_status == IRQ_RX_DONE, (
+            f"Packet lost: _last_irq_status={radio._last_irq_status:#06x}, "
+            f"expected IRQ_RX_DONE ({IRQ_RX_DONE:#06x}). "
+            "The duplicate _handle_interrupt call corrupted packet state. "
+            "On dev this will be 0x0000."
+        )
