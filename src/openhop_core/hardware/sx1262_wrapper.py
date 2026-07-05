@@ -296,8 +296,7 @@ class SX1262Radio(LoRaRadio):
 
             if irqStat != 0:
                 self.lora.clearIrqStatus(0xFFFF)
-
-            self._last_irq_status = irqStat
+                self._last_irq_status = irqStat
             if irqStat & self.lora.IRQ_TX_DONE:
                 logger.debug("[TX] TX_DONE interrupt (0x{:04X})".format(self.lora.IRQ_TX_DONE))
                 self._tx_done_event.set()

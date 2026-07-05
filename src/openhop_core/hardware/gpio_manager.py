@@ -530,6 +530,10 @@ class GPIOPinManager:
                                 callback()
                             except Exception:
                                 pass
+                    elif current and last_state:
+                        # last_state is stuck HIGH — reset so the next tick fires naturally
+                        last_state = False
+                        continue
                     last_state = current
                     time.sleep(interval)
                 except Exception:
