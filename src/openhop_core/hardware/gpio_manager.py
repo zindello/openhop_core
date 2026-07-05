@@ -532,6 +532,7 @@ class GPIOPinManager:
                                 pass
                     elif current and last_state:
                         # last_state is stuck HIGH — reset so the next tick fires naturally
+                        logger.debug(f"[GPIO] Pin {pin_number}: stuck-HIGH detected, resetting edge baseline")
                         last_state = False
                         continue
                     last_state = current
